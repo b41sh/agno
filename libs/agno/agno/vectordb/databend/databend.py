@@ -11,8 +11,8 @@ try:
 except ImportError:
     raise ImportError("`databend-driver` not installed. Use `pip install databend-driver` to install it")
 
-from agno.document import Document
-from agno.embedder import Embedder
+#from agno.document import Document
+#from agno.embedder import Embedder
 from agno.utils.log import log_debug, log_info, logger
 from agno.vectordb.base import VectorDb
 from agno.vectordb.distance import Distance
@@ -36,8 +36,9 @@ class Databend(VectorDb):
         database_name: str = "ai",
         dsn: Optional[str] = None,
         compress: str = "lz4",
-        client: Optional[databend_driver.BlockingDatabendConnection] = None,
-        asyncclient: Optional[databend_driver.AsyncDatabendConnection] = None,
+        #client: Optional[databend-driver.BlockingDatabendConnection] = None,
+        client: Optional[databend.BlockingDatabendConnection] = None,
+        asyncclient: Optional[databend-driver.AsyncDatabendConnection] = None,
         embedder: Optional[Embedder] = None,
         distance: Distance = Distance.cosine,
         index: Optional[HNSW] = HNSW(),
