@@ -1,5 +1,8 @@
+import asyncio
+import json
 from hashlib import md5
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 from agno.vectordb.databend.index import HNSW
 
@@ -70,6 +73,9 @@ class Databend(VectorDb):
             log_info("Embedder not provided, using OpenAIEmbedder as default.")
         self.embedder: Embedder = _embedder
         self.dimensions: Optional[int] = self.embedder.dimensions
+
+        if self.dimensions is None:
+            raise ValueError("Embedder.dimensions must be set.")
 
         # Distance metric
         self.distance: Distance = distance
@@ -152,7 +158,7 @@ class Databend(VectorDb):
                     filters Variant DEFAULT '{{}}',
                     content String,
                     content_id String,
-                    embedding Array(Float32),
+                    embedding Vector({self.dimensions}),
                     usage Variant,
                     created_at DateTime DEFAULT now(),
                     content_hash String
@@ -180,8 +186,6 @@ class Databend(VectorDb):
             else:
                 raise NotImplementedError(f"Not implemented index {type(self.index)!r} is passed")
 
-            #await self.async_client.command("SET enable_json_type = 1")  # type: ignore
-
             await self.async_client.exec(
                 f"""CREATE TABLE IF NOT EXISTS {self.database_name}.{self.table_name}
                 (
@@ -191,10 +195,10 @@ class Databend(VectorDb):
                     filters Variant DEFAULT '{{}}',
                     content String,
                     content_id String,
-                    embedding Array(Float32),
-                    usage variant,
+                    embedding Vector({self.dimensions}),
+                    usage Variant,
                     created_at DateTime DEFAULT now(),
-                    content_hash String,
+                    content_hash String
                 ) ENGINE = Fuse""",
             )
 
@@ -277,80 +281,69 @@ class Databend(VectorDb):
 
     def insert(
         self,
+        content_hash: str,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
         rows: List[List[Any]] = []
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for document in documents:
             document.embed(embedder=self.embedder)
             cleaned_content = document.content.replace("\x00", "\ufffd")
-            content_hash = md5(cleaned_content.encode()).hexdigest()
-            _id = document.id or content_hash
+            _id = md5(cleaned_content.encode()).hexdigest()
 
             row: List[Any] = [
                 _id,
                 document.name,
-                document.meta_data,
-                filters,
+                json.dumps(document.meta_data),
+                json.dumps(filters),
                 cleaned_content,
+                document.content_id,
                 document.embedding,
-                document.usage,
+                json.dumps(document.usage),
+                created_at,
                 content_hash,
             ]
             rows.append(row)
 
-        self.client.insert(
-            f"{self.database_name}.{self.table_name}",
+        self.client.exec(
+            f"INSERT INTO {self.database_name}.{self.table_name} VALUES",
             rows,
-            column_names=[
-                "id",
-                "name",
-                "meta_data",
-                "filters",
-                "content",
-                "embedding",
-                "usage",
-                "content_hash",
-            ],
         )
         log_debug(f"Inserted {len(documents)} documents")
 
-    async def async_insert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
+    async def async_insert(
+        self, content_hash: str, documents: List[Document], filters: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Insert documents asynchronously."""
         rows: List[List[Any]] = []
         async_client = await self._ensure_async_client()
 
+        embed_tasks = [document.async_embed(embedder=self.embedder) for document in documents]
+        await asyncio.gather(*embed_tasks, return_exceptions=True)
+
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for document in documents:
-            document.embed(embedder=self.embedder)
             cleaned_content = document.content.replace("\x00", "\ufffd")
-            content_hash = md5(cleaned_content.encode()).hexdigest()
-            _id = document.id or content_hash
+            _id = md5(cleaned_content.encode()).hexdigest()
 
             row: List[Any] = [
                 _id,
                 document.name,
-                document.meta_data,
-                filters,
+                json.dumps(document.meta_data),
+                json.dumps(filters),
                 cleaned_content,
+                document.content_id,
                 document.embedding,
-                document.usage,
+                json.dumps(document.usage),
+                created_at,
                 content_hash,
             ]
             rows.append(row)
 
-        await async_client.insert(
-            f"{self.database_name}.{self.table_name}",
+        await async_client.exec(
+            f"INSERT INTO {self.database_name}.{self.table_name} VALUES",
             rows,
-            column_names=[
-                "id",
-                "name",
-                "meta_data",
-                "filters",
-                "content",
-                "embedding",
-                "usage",
-                "content_hash",
-            ],
         )
         log_debug(f"Async inserted {len(documents)} documents")
 
@@ -359,38 +352,92 @@ class Databend(VectorDb):
 
     def upsert(
         self,
+        content_hash: str,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Upsert documents into the database.
-
-        Args:
-            documents (List[Document]): List of documents to upsert
-            filters (Optional[Dict[str, Any]]): Filters to apply while upserting documents
-            batch_size (int): Batch size for upserting documents
         """
-        # We are using ReplacingMergeTree engine in our table, so we need to insert the documents,
-        # then call SELECT with FINAL
-        self.insert(documents=documents, filters=filters)
+        if self.content_hash_exists(content_hash):
+            self._delete_by_content_hash(content_hash)
+        self._upsert(content_hash=content_hash, documents=documents, filters=filters)
 
-        parameters = self._get_base_parameters()
-        self.client.query(
-            "SELECT id FROM {database_name:Identifier}.{table_name:Identifier} FINAL",
-            parameters=parameters,
+    def _upsert(
+        self,
+        content_hash: str,
+        documents: List[Document],
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        rows: List[List[Any]] = []
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for document in documents:
+            document.embed(embedder=self.embedder)
+            cleaned_content = document.content.replace("\x00", "\ufffd")
+            _id = md5(cleaned_content.encode()).hexdigest()
+
+            row: List[Any] = [
+                _id,
+                document.name,
+                json.dumps(document.meta_data),
+                json.dumps(filters),
+                cleaned_content,
+                document.content_id,
+                document.embedding,
+                json.dumps(document.usage),
+                created_at,
+                content_hash,
+            ]
+            rows.append(row)
+
+        self.client.exec(
+            f"REPLACE INTO {self.database_name}.{self.table_name} ON(content_hash) VALUES",
+            rows,
         )
+        log_debug(f"Replaced {len(documents)} documents")
 
-    async def async_upsert(self, documents: List[Document], filters: Optional[Dict[str, Any]] = None) -> None:
+    async def async_upsert(
+        self, content_hash: str, documents: List[Document], filters: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Upsert documents asynchronously."""
-        # We are using ReplacingMergeTree engine in our table, so we need to insert the documents,
-        # then call SELECT with FINAL
-        await self.async_insert(documents=documents, filters=filters)
+        if self.content_hash_exists(content_hash):
+            self._delete_by_content_hash(content_hash)
+        await self._async_upsert(content_hash=content_hash, documents=documents, filters=filters)
 
-        parameters = self._get_base_parameters()
-        await self.async_client.query(  # type: ignore
-            "SELECT id FROM {database_name:Identifier}.{table_name:Identifier} FINAL",
-            parameters=parameters,
+    async def _async_upsert(
+        self, content_hash: str, documents: List[Document], filters: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Upsert documents asynchronously."""
+        rows: List[List[Any]] = []
+        async_client = await self._ensure_async_client()
+
+        embed_tasks = [document.async_embed(embedder=self.embedder) for document in documents]
+        await asyncio.gather(*embed_tasks, return_exceptions=True)
+
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for document in documents:
+            cleaned_content = document.content.replace("\x00", "\ufffd")
+            _id = md5(cleaned_content.encode()).hexdigest()
+
+            row: List[Any] = [
+                _id,
+                document.name,
+                json.dumps(document.meta_data),
+                json.dumps(filters),
+                cleaned_content,
+                document.content_id,
+                document.embedding,
+                json.dumps(document.usage),
+                created_at,
+                content_hash,
+            ]
+            rows.append(row)
+
+        await async_client.exec(
+            f"REPLACE INTO {self.database_name}.{self.table_name} ON(content_hash) VALUES",
+            rows,
         )
+        log_debug(f"Async replaced {len(documents)} documents")
 
     def search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
         query_embedding = self.embedder.get_embedding(query)
@@ -398,36 +445,23 @@ class Databend(VectorDb):
             logger.error(f"Error getting embedding for Query: {query}")
             return []
 
-        parameters = self._get_base_parameters()
         where_query = ""
-        # if filters:
-        #     query_filters: List[str] = []
-        #     for key, value in filters.values():
-        #         query_filters.append(f"{{{key}_key:String}} = {{{key}_value:String}}")
-        #         parameters[f"{key}_key"] = key
-        #         parameters[f"{key}_value"] = value
-        #     where_query = f"WHERE {' AND '.join(query_filters)}"
-
         order_by_query = ""
         if self.distance == Distance.l2 or self.distance == Distance.max_inner_product:
-            order_by_query = "ORDER BY L2Distance(embedding, {query_embedding:Array(Float32)})"
-            parameters["query_embedding"] = query_embedding
+            order_by_query = f"ORDER BY l2_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
         if self.distance == Distance.cosine:
-            order_by_query = "ORDER BY cosineDistance(embedding, {query_embedding:Array(Float32)})"
-            parameters["query_embedding"] = query_embedding
+            order_by_query = f"ORDER BY cosine_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
 
-        databend_query = (
-            "SELECT name, meta_data, content, embedding, usage FROM "
-            "{database_name:Identifier}.{table_name:Identifier} "
+        query = (
+            "SELECT name, meta_data, content, content_id, embedding, usage FROM "
+            f"{self.database_name}.{self.table_name} "
             f"{where_query} {order_by_query} LIMIT {limit}"
         )
-        log_debug(f"Query: {databend_query}")
-        log_debug(f"Params: {parameters}")
+        log_debug(f"Query: {query}")
 
         try:
-            results = self.client.query(
-                databend_query,
-                parameters=parameters,
+            results = self.client.query_all(
+                query,
             )
         except Exception as e:
             logger.error(f"Error searching for documents: {e}")
@@ -437,15 +471,16 @@ class Databend(VectorDb):
 
         # Build search results
         search_results: List[Document] = []
-        for result in results.result_rows:
+        for row in results:
             search_results.append(
                 Document(
-                    name=result[0],
-                    meta_data=result[1],
-                    content=result[2],
+                    name=row.values()[0],
+                    meta_data=row.values()[1],
+                    content=row.values()[2],
+                    content_id=row.values()[3],
                     embedder=self.embedder,
-                    embedding=result[3],
-                    usage=result[4],
+                    embedding=row.values()[4],
+                    usage=row.values()[5],
                 )
             )
 
@@ -464,34 +499,23 @@ class Databend(VectorDb):
 
         parameters = self._get_base_parameters()
         where_query = ""
-        # if filters:
-        #     query_filters: List[str] = []
-        #     for key, value in filters.values():
-        #         query_filters.append(f"{{{key}_key:String}} = {{{key}_value:String}}")
-        #         parameters[f"{key}_key"] = key
-        #         parameters[f"{key}_value"] = value
-        #     where_query = f"WHERE {' AND '.join(query_filters)}"
 
         order_by_query = ""
         if self.distance == Distance.l2 or self.distance == Distance.max_inner_product:
-            order_by_query = "ORDER BY L2Distance(embedding, {query_embedding:Array(Float32)})"
-            parameters["query_embedding"] = query_embedding
+            order_by_query = f"ORDER BY l2_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
         if self.distance == Distance.cosine:
-            order_by_query = "ORDER BY cosineDistance(embedding, {query_embedding:Array(Float32)})"
-            parameters["query_embedding"] = query_embedding
+            order_by_query = f"ORDER BY cosine_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
 
-        databend_query = (
-            "SELECT name, meta_data, content, embedding, usage FROM "
-            "{database_name:Identifier}.{table_name:Identifier} "
+        query = (
+            "SELECT name, meta_data, content, content_id, embedding, usage FROM "
+            f"{self.database_name}.{self.table_name} "
             f"{where_query} {order_by_query} LIMIT {limit}"
         )
-        log_debug(f"Async Query: {databend_query}")
-        log_debug(f"Async Params: {parameters}")
+        log_debug(f"Async Query: {query}")
 
         try:
-            results = await async_client.query(
-                databend_query,
-                parameters=parameters,
+            results = await async_client.query_all(
+                clickhouse_query,
             )
         except Exception as e:
             logger.error(f"Async error searching for documents: {e}")
@@ -501,15 +525,16 @@ class Databend(VectorDb):
 
         # Build search results
         search_results: List[Document] = []
-        for result in results.result_rows:
+        for row in results:
             search_results.append(
                 Document(
-                    name=result[0],
-                    meta_data=result[1],
-                    content=result[2],
+                    name=row.values()[0],
+                    meta_data=row.values()[1],
+                    content=row.values()[2],
+                    content_id=row.values()[3],
                     embedder=self.embedder,
-                    embedding=result[3],
-                    usage=result[4],
+                    embedding=row.values()[4],
+                    usage=row.values()[5],
                 )
             )
 
@@ -693,7 +718,6 @@ class Databend(VectorDb):
             content_id (str): The content ID to update
             metadata (Dict[str, Any]): The metadata to update
         """
-        import json
 
         try:
             # First, get existing documents with their current metadata and filters
