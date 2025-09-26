@@ -9,9 +9,9 @@ agent = Agent(
         vector_db=Databend(
             table_name="recipe_documents",
             host="localhost",
-            port=48000,
-            username="ai",
-            password="ai",
+            port=8000,
+            username="default",
+            password="",
         ),
     ),
     # Enable the agent to search the knowledge base

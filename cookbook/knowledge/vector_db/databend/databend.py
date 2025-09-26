@@ -4,18 +4,15 @@ from agno.vectordb.databend import Databend
 
 vector_db = Databend(
     table_name="recipe_documents",
-    #host="localhost",
-    host="100.73.238.81",
-    port=48000,
-    #username="ai",
-    #password="ai",
+    host="localhost",
+    port=8000,
     username="default",
     password="",
 )
 
 knowledge = Knowledge(
     name="My Databend Knowledge Base",
-    description="This is a knowledge base that uses a Databend DB",
+    description="This is a knowledge base that uses a Databend",
     vector_db=vector_db,
 )
 

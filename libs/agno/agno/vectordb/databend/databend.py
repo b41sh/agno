@@ -20,6 +20,7 @@ from agno.utils.log import log_debug, log_info, logger
 from agno.vectordb.base import VectorDb
 from agno.vectordb.distance import Distance
 
+
 class Databend(VectorDb):
     """
     Databend class for managing vector operations with Databend.
@@ -56,7 +57,6 @@ class Databend(VectorDb):
                 f"databend://{self.username}:{self.password}@{self.host}:{self.port}/{self.database_name}?sslmode=disable"
             )
             client = databend_client.get_conn()
-            #client = databend_client.cursor()
 
         # Database attributes
         self.client = client
@@ -95,38 +95,42 @@ class Databend(VectorDb):
         columns = [
             "id String",
             "name String",
-            "meta_data Variant DEFAULT '{{}}'",
-            "filters Variant DEFAULT '{{}}'",
+            "meta_data Variant DEFAULT '{}'",
+            "filters Variant DEFAULT '{}'",
             "content String",
             "content_id String",
-            "c Vector({self.dimensions})",
+            f"embedding Vector({self.dimensions})",
             "usage Variant",
             "created_at DateTime DEFAULT now()",
-            "content_hash String"
+            "content_hash String",
         ]
 
-        allow_vector_index_feature = False
-        try:
-            result = self.client.query_row("CALL license_info()")
-            if result is not None:
-                features = str(res.values()[6])
-                if "Unlimited" in features or "vector_index" in features:
-                    allow_vector_index_feature = True
-        except Exception:
-            pass
+        if isinstance(self.index, HNSW):
+            allow_vector_index_feature = False
+            try:
+                result = self.client.query_row("CALL license_info()")
+                if result is not None:
+                    features = str(result.values()[6])
+                    if "Unlimited" in features or "vector_index" in features:
+                        allow_vector_index_feature = True
+            except Exception:
+                pass
 
-        if allow_vector_index_feature and self.index is not None:
-            name = f"idx_{self.table_name}_embedding"
-            if self.index.name is not None:
-                name = self.index.name
+            if allow_vector_index_feature:
+                name = f"idx_{self.table_name}_embedding"
+                if self.index.name is not None:
+                    name = self.index.name
+                m = self.index.m
+                ef_construct = self.index.ef_construct
 
-            distance = "cosine"
-            if self.distance == Distance.l2:
-                distance = "l2"
-            m = self.distance.m
-            ef_construct = self.distance.ef_construct
+                distance = "cosine"
+                if self.distance == Distance.l2:
+                    distance = "l2"
 
-            columns.append(f"VECTOR INDEX {name}(embedding) distance='{distance}' m='{m}' ef_construct='{ef_construct}'")
+                columns.append(
+                    f"VECTOR INDEX {name}(embedding) distance='{distance}' m='{m}' ef_construct='{ef_construct}'"
+                )
+        return columns
 
     def table_exists(self) -> bool:
         log_debug(f"Checking if table exists: {self.table_name}")
@@ -162,20 +166,9 @@ class Databend(VectorDb):
     def create(self) -> None:
         if not self.table_exists():
             log_debug(f"Creating Database: {self.database_name}")
-            self.client.exec(
-                f"CREATE DATABASE IF NOT EXISTS {self.database_name}"
-            )
+            self.client.exec(f"CREATE DATABASE IF NOT EXISTS {self.database_name}")
 
             log_debug(f"Creating table: {self.table_name}")
-
-            if isinstance(self.index, HNSW):
-                index = (
-                    f"INDEX embedding_index embedding TYPE vector_similarity('hnsw', 'L2Distance', {self.embedder.dimensions}, {self.index.quantization}, "
-                    f"{self.index.hnsw_max_connections_per_layer}, {self.index.hnsw_candidate_list_size_for_construction})"
-                )
-                #self.client.command("SET allow_experimental_vector_similarity_index = 1")
-            else:
-                raise NotImplementedError(f"Not implemented index {type(self.index)!r} is passed")
 
             columns = self._get_table_columns()
             column_defs = ", ".join(columns)
@@ -195,15 +188,6 @@ class Databend(VectorDb):
             )
 
             log_debug(f"Async creating table: {self.table_name}")
-
-            if isinstance(self.index, HNSW):
-                index = (
-                    f"INDEX embedding_index embedding TYPE vector_similarity('hnsw', 'L2Distance', {self.index.quantization}, "
-                    f"{self.index.hnsw_max_connections_per_layer}, {self.index.hnsw_candidate_list_size_for_construction})"
-                )
-                #await async_client.command("SET allow_experimental_vector_similarity_index = 1")
-            else:
-                raise NotImplementedError(f"Not implemented index {type(self.index)!r} is passed")
 
             columns = self._get_table_columns()
             column_defs = ", ".join(columns)
