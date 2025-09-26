@@ -153,7 +153,7 @@ class Databend(VectorDb):
             async_client = await self._ensure_async_client()
 
             result = await async_client.query_row(
-                "EXISTS TABLE {self.database_name}.{self.table_name}",
+                f"EXISTS TABLE {self.database_name}.{self.table_name}",
             )
             if result is not None:
                 return bool(result.values()[0])
@@ -643,7 +643,7 @@ class Databend(VectorDb):
 
         try:
             results = await async_client.query_all(
-                clickhouse_query,
+                query,
             )
         except Exception as e:
             logger.error(f"Async error searching for documents: {e}")
@@ -788,7 +788,6 @@ class Databend(VectorDb):
         try:
             log_debug(f"Databend : Deleting documents with metadata {metadata}")
 
-            # Build WHERE clause for metadata matching using proper ClickHouse JSON syntax
             where_conditions = []
             for key, value in metadata.items():
                 if isinstance(value, bool):
