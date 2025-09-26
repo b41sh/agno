@@ -37,7 +37,6 @@ class Databend(VectorDb):
         port: int = 0,
         database_name: str = "ai",
         dsn: Optional[str] = None,
-        compress: str = "lz4",
         client: Optional[BlockingDatabendConnection] = None,
         asyncclient: Optional[AsyncDatabendConnection] = None,
         embedder: Optional[Embedder] = None,
@@ -50,7 +49,6 @@ class Databend(VectorDb):
         self.password = password
         self.port = port
         self.dsn = dsn
-        self.compress = compress
         self.database_name = database_name
 
         if not client:
@@ -93,11 +91,42 @@ class Databend(VectorDb):
             self.async_client = await databend_async_client.get_conn()
         return self.async_client
 
-    def _get_base_parameters(self) -> Dict[str, Any]:
-        return {
-            "table_name": self.table_name,
-            "database_name": self.database_name,
-        }
+    def _get_table_columns(self) -> List[str]:
+        columns = [
+            "id String",
+            "name String",
+            "meta_data Variant DEFAULT '{{}}'",
+            "filters Variant DEFAULT '{{}}'",
+            "content String",
+            "content_id String",
+            "c Vector({self.dimensions})",
+            "usage Variant",
+            "created_at DateTime DEFAULT now()",
+            "content_hash String"
+        ]
+
+        allow_vector_index_feature = False
+        try:
+            result = self.client.query_row("CALL license_info()")
+            if result is not None:
+                features = str(res.values()[6])
+                if "Unlimited" in features or "vector_index" in features:
+                    allow_vector_index_feature = True
+        except Exception:
+            pass
+
+        if allow_vector_index_feature and self.index is not None:
+            name = f"idx_{self.table_name}_embedding"
+            if self.index.name is not None:
+                name = self.index.name
+
+            distance = "cosine"
+            if self.distance == Distance.l2:
+                distance = "l2"
+            m = self.distance.m
+            ef_construct = self.distance.ef_construct
+
+            columns.append(f"VECTOR INDEX {name}(embedding) distance='{distance}' m='{m}' ef_construct='{ef_construct}'")
 
     def table_exists(self) -> bool:
         log_debug(f"Checking if table exists: {self.table_name}")
@@ -139,8 +168,6 @@ class Databend(VectorDb):
 
             log_debug(f"Creating table: {self.table_name}")
 
-            parameters = self._get_base_parameters()
-
             if isinstance(self.index, HNSW):
                 index = (
                     f"INDEX embedding_index embedding TYPE vector_similarity('hnsw', 'L2Distance', {self.embedder.dimensions}, {self.index.quantization}, "
@@ -150,20 +177,11 @@ class Databend(VectorDb):
             else:
                 raise NotImplementedError(f"Not implemented index {type(self.index)!r} is passed")
 
+            columns = self._get_table_columns()
+            column_defs = ", ".join(columns)
+
             self.client.exec(
-                f"""CREATE TABLE IF NOT EXISTS {self.database_name}.{self.table_name}
-                (
-                    id String,
-                    name String,
-                    meta_data Variant DEFAULT '{{}}',
-                    filters Variant DEFAULT '{{}}',
-                    content String,
-                    content_id String,
-                    embedding Vector({self.dimensions}),
-                    usage Variant,
-                    created_at DateTime DEFAULT now(),
-                    content_hash String
-                ) ENGINE = Fuse""",
+                f"CREATE TABLE IF NOT EXISTS {self.database_name}.{self.table_name}({column_defs}) ENGINE = Fuse"
             )
 
     async def async_create(self) -> None:
@@ -187,61 +205,22 @@ class Databend(VectorDb):
             else:
                 raise NotImplementedError(f"Not implemented index {type(self.index)!r} is passed")
 
+            columns = self._get_table_columns()
+            column_defs = ", ".join(columns)
+
             await self.async_client.exec(
-                f"""CREATE TABLE IF NOT EXISTS {self.database_name}.{self.table_name}
-                (
-                    id String,
-                    name String,
-                    meta_data Variant DEFAULT '{{}}',
-                    filters Variant DEFAULT '{{}}',
-                    content String,
-                    content_id String,
-                    embedding Vector({self.dimensions}),
-                    usage Variant,
-                    created_at DateTime DEFAULT now(),
-                    content_hash String
-                ) ENGINE = Fuse""",
+                f"CREATE TABLE IF NOT EXISTS {self.database_name}.{self.table_name}({column_defs}) ENGINE = Fuse"
             )
-
-    def doc_exists(self, document: Document) -> bool:
-        """
-        Validating if the document exists or not
-
-        Args:
-            document (Document): Document to validate
-        """
-        cleaned_content = document.content.replace("\x00", "\ufffd")
-        content_hash = md5(cleaned_content.encode()).hexdigest()
-
-        result = self.client.query_row(
-            f"SELECT content_hash FROM {self.database_name}.{self.table_name} WHERE content_hash = '{content_hash}'",
-        )
-        if result is not None:
-            return bool(len(result) > 0)
-        else:
-            return False
-
-    async def async_doc_exists(self, document: Document) -> bool:
-        """Check if a document exists asynchronously."""
-        async_client = await self._ensure_async_client()
-
-        cleaned_content = document.content.replace("\x00", "\ufffd")
-        content_hash = md5(cleaned_content.encode()).hexdigest()
-
-        result = await async_client.query_row(
-            f"SELECT content_hash FROM {self.database_name}.{self.table_name} WHERE content_hash = '{content_hash}'",
-        )
-        if result is not None:
-            return bool(len(result) > 0)
-        else:
-            return False
 
     def name_exists(self, name: str) -> bool:
         """
-        Validate if a row with this name exists or not
+        Check if a document with the given name exists in the table.
 
         Args:
-            name (str): Name to check
+            name (str): The name to check.
+
+        Returns:
+            bool: True if a document with the name exists, False otherwise.
         """
 
         result = self.client.query_row(
@@ -253,7 +232,7 @@ class Databend(VectorDb):
             return False
 
     async def async_name_exists(self, name: str) -> bool:
-        """Check if a document with given name exists asynchronously."""
+        """Check if name exists asynchronously by running in a thread."""
         async_client = await self._ensure_async_client()
 
         result = await async_client.query_row(
@@ -266,10 +245,13 @@ class Databend(VectorDb):
 
     def id_exists(self, id: str) -> bool:
         """
-        Validate if a row with this id exists or not
+        Check if a document with the given ID exists in the table.
 
         Args:
-            id (str): Id to check
+            id (str): The ID to check.
+
+        Returns:
+            bool: True if a document with the ID exists, False otherwise.
         """
 
         result = self.client.query_row(
@@ -280,12 +262,38 @@ class Databend(VectorDb):
         else:
             return False
 
+    def content_hash_exists(self, content_hash: str) -> bool:
+        """
+        Check if a document with the given content hash exists in the table.
+
+        Args:
+            content_hash (str): The content hash to check.
+
+        Returns:
+            bool: True if a document with the given content hash exists, False otherwise.
+        """
+        result = self.client.query_row(
+            f"SELECT content_hash FROM {self.database_name}.{self.table_name} WHERE content_hash = '{content_hash}'",
+        )
+        if not result or len(result) == 0:
+            return False
+        else:
+            return True
+
     def insert(
         self,
         content_hash: str,
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """
+        Insert documents into the database.
+
+        Args:
+            content_hash (str): The content hash to insert.
+            documents (List[Document]): List of documents to insert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+        """
         rows: List[List[Any]] = []
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for document in documents:
@@ -293,10 +301,14 @@ class Databend(VectorDb):
             cleaned_content = document.content.replace("\x00", "\ufffd")
             _id = md5(cleaned_content.encode()).hexdigest()
 
+            meta_data = document.meta_data or {}
+            if filters:
+                meta_data.update(filters)
+
             row: List[Any] = [
                 _id,
                 document.name,
-                json.dumps(document.meta_data),
+                json.dumps(meta_data),
                 json.dumps(filters),
                 cleaned_content,
                 document.content_id,
@@ -307,7 +319,7 @@ class Databend(VectorDb):
             ]
             rows.append(row)
 
-        self.client.executemany(
+        self.client.stream_load(
             f"INSERT INTO {self.database_name}.{self.table_name} VALUES",
             rows,
         )
@@ -316,7 +328,6 @@ class Databend(VectorDb):
     async def async_insert(
         self, content_hash: str, documents: List[Document], filters: Optional[Dict[str, Any]] = None
     ) -> None:
-        print("\n\n----insert22-------")
         """Insert documents asynchronously."""
         rows: List[List[Any]] = []
         async_client = await self._ensure_async_client()
@@ -329,10 +340,14 @@ class Databend(VectorDb):
             cleaned_content = document.content.replace("\x00", "\ufffd")
             _id = md5(cleaned_content.encode()).hexdigest()
 
+            meta_data = document.meta_data or {}
+            if filters:
+                meta_data.update(filters)
+
             row: List[Any] = [
                 _id,
                 document.name,
-                json.dumps(document.meta_data),
+                json.dumps(meta_data),
                 json.dumps(filters),
                 cleaned_content,
                 document.content_id,
@@ -343,19 +358,19 @@ class Databend(VectorDb):
             ]
             rows.append(row)
 
-        #print("\n\n\n\n")
-        #print("rows=", rows)
-        #print("\n\n\n\n")
-
-        #result = await async_client.executemany(
-        result = await async_client.stream_load(
+        await async_client.stream_load(
             f"INSERT INTO {self.database_name}.{self.table_name} VALUES",
             rows,
         )
-        print("result=", result)
         log_debug(f"Async inserted {len(documents)} documents")
 
     def upsert_available(self) -> bool:
+        """
+        Check if upsert operation is available.
+
+        Returns:
+            bool: Always returns True for Databend.
+        """
         return True
 
     def upsert(
@@ -365,11 +380,17 @@ class Databend(VectorDb):
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
-        Upsert documents into the database.
+        Upsert documents by content hash.
+        First delete all documents with the same content hash.
+        Then upsert the new documents.
         """
-        if self.content_hash_exists(content_hash):
-            self._delete_by_content_hash(content_hash)
-        self._upsert(content_hash=content_hash, documents=documents, filters=filters)
+        try:
+            if self.content_hash_exists(content_hash):
+                self._delete_by_content_hash(content_hash)
+            self._upsert(content_hash, documents, filters)
+        except Exception as e:
+            logger.error(f"Error upserting documents by content hash: {e}")
+            raise
 
     def _upsert(
         self,
@@ -377,6 +398,14 @@ class Databend(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """
+        Upsert (insert or update) documents in the database.
+
+        Args:
+            content_hash (str): The content hash to upsert.
+            documents (List[Document]): List of documents to upsert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+        """
         rows: List[List[Any]] = []
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for document in documents:
@@ -384,10 +413,14 @@ class Databend(VectorDb):
             cleaned_content = document.content.replace("\x00", "\ufffd")
             _id = md5(cleaned_content.encode()).hexdigest()
 
+            meta_data = document.meta_data or {}
+            if filters:
+                meta_data.update(filters)
+
             row: List[Any] = [
                 _id,
                 document.name,
-                json.dumps(document.meta_data),
+                json.dumps(meta_data),
                 json.dumps(filters),
                 cleaned_content,
                 document.content_id,
@@ -398,8 +431,8 @@ class Databend(VectorDb):
             ]
             rows.append(row)
 
-        self.client.executemany(
-            f"REPLACE INTO {self.database_name}.{self.table_name} ON(content_hash) VALUES",
+        self.client.stream_load(
+            f"REPLACE INTO {self.database_name}.{self.table_name} ON(id) VALUES",
             rows,
         )
         log_debug(f"Replaced {len(documents)} documents")
@@ -415,7 +448,14 @@ class Databend(VectorDb):
     async def _async_upsert(
         self, content_hash: str, documents: List[Document], filters: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Upsert documents asynchronously."""
+        """
+        Upsert (insert or update) documents in the database.
+
+        Args:
+            content_hash (str): The content hash to upsert.
+            documents (List[Document]): List of documents to upsert.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the documents.
+        """
         rows: List[List[Any]] = []
         async_client = await self._ensure_async_client()
 
@@ -441,29 +481,114 @@ class Databend(VectorDb):
             ]
             rows.append(row)
 
-        await async_client.executemany(
-            f"REPLACE INTO {self.database_name}.{self.table_name} ON(content_hash) VALUES",
+        await async_client.stream_load(
+            f"REPLACE INTO {self.database_name}.{self.table_name} ON(id) VALUES",
             rows,
         )
         log_debug(f"Async replaced {len(documents)} documents")
 
+    def update_metadata(self, content_id: str, metadata: Dict[str, Any]) -> None:
+        """
+        Update the metadata for documents with the given content_id.
+
+        Args:
+            content_id (str): The content ID to update
+            metadata (Dict[str, Any]): The metadata to update
+        """
+
+        try:
+            # First, get existing documents with their current metadata and filters
+            result = self.client.query_all(
+                f"SELECT id, meta_data, filters FROM {self.database_name}.{self.table_name} WHERE content_id = '{content_id}'",
+            )
+
+            if result is None or len(result) == 0:
+                logger.debug(f"No documents found with content_id: {content_id}")
+                return
+
+            # Update each document
+            updated_count = 0
+            for row in result:
+                doc_id, current_meta_json, current_filters_json = row.values()
+
+                # Parse existing metadata
+                try:
+                    current_metadata = json.loads(current_meta_json) if current_meta_json else {}
+                except (json.JSONDecodeError, TypeError):
+                    current_metadata = {}
+
+                # Parse existing filters
+                try:
+                    current_filters = json.loads(current_filters_json) if current_filters_json else {}
+                except (json.JSONDecodeError, TypeError):
+                    current_filters = {}
+
+                # Merge existing metadata with new metadata
+                updated_metadata = current_metadata.copy()
+                updated_metadata.update(metadata)
+
+                # Merge existing filters with new metadata
+                updated_filters = current_filters.copy()
+                updated_filters.update(metadata)
+
+                # Update the document
+                update_params = parameters.copy()
+                metadata_json = json.dumps(updated_metadata)
+                filters_json = json.dumps(updated_filters)
+
+                self.client.command(
+                    f"ALTER TABLE {self.database_name}.{self.table_name} UPDATE meta_data = '{metadata_json}', filters = '{filters_json}' WHERE id = '{doc_id}'",
+                )
+                updated_count += 1
+
+            logger.debug(f"Updated metadata for {updated_count} documents with content_id: {content_id}")
+
+        except Exception as e:
+            logger.error(f"Error updating metadata for content_id '{content_id}': {e}")
+            raise
+
     def search(self, query: str, limit: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """
+        Perform a search based on the configured search type.
+
+        Args:
+            query (str): The search query.
+            limit (int): Maximum number of results to return.
+            filters (Optional[Dict[str, Any]]): Filters to apply to the search.
+
+        Returns:
+            List[Document]: List of matching documents.
+        """
+
         query_embedding = self.embedder.get_embedding(query)
         if query_embedding is None:
             logger.error(f"Error getting embedding for Query: {query}")
             return []
 
-        where_query = ""
-        order_by_query = ""
-        if self.distance == Distance.l2 or self.distance == Distance.max_inner_product:
-            order_by_query = f"ORDER BY l2_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
-        if self.distance == Distance.cosine:
-            order_by_query = f"ORDER BY cosine_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
+        where_clause = ""
+        if filters is not None:
+            where_conditions = []
+            for key, value in filters.items():
+                if isinstance(value, bool):
+                    where_conditions.append(f"meta_data['{key}'] = {str(value).lower()}")
+                elif isinstance(value, (int, float)):
+                    where_conditions.append(f"meta_data['{key}'] = {value}")
+                else:
+                    where_conditions.append(f"meta_data['{key}'] = '{value}'")
+            if len(where_conditions) > 0:
+                conditions = " AND ".join(where_conditions)
+                where_clause = f"WHERE {conditions}"
+
+        order_by_clause = ""
+        if self.distance == Distance.l2:
+            order_by_clause = f"ORDER BY l2_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
+        if self.distance == Distance.cosine or self.distance == Distance.max_inner_product:
+            order_by_clause = f"ORDER BY cosine_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
 
         query = (
             "SELECT name, meta_data, content, content_id, embedding, usage FROM "
             f"{self.database_name}.{self.table_name} "
-            f"{where_query} {order_by_query} LIMIT {limit}"
+            f"{where_clause} {order_by_clause} LIMIT {limit}"
         )
         log_debug(f"Query: {query}")
 
@@ -505,19 +630,30 @@ class Databend(VectorDb):
             logger.error(f"Error getting embedding for Query: {query}")
             return []
 
-        parameters = self._get_base_parameters()
-        where_query = ""
+        where_clause = ""
+        if filters is not None:
+            where_conditions = []
+            for key, value in filters.items():
+                if isinstance(value, bool):
+                    where_conditions.append(f"meta_data['{key}'] = {str(value).lower()}")
+                elif isinstance(value, (int, float)):
+                    where_conditions.append(f"meta_data['{key}'] = {value}")
+                else:
+                    where_conditions.append(f"meta_data['{key}'] = '{value}'")
+            if len(where_conditions) > 0:
+                conditions = " AND ".join(where_conditions)
+                where_clause = f"WHERE {conditions}"
 
-        order_by_query = ""
-        if self.distance == Distance.l2 or self.distance == Distance.max_inner_product:
-            order_by_query = f"ORDER BY l2_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
-        if self.distance == Distance.cosine:
-            order_by_query = f"ORDER BY cosine_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
+        order_by_clause = ""
+        if self.distance == Distance.l2:
+            order_by_clause = f"ORDER BY l2_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
+        if self.distance == Distance.cosine or self.distance == Distance.max_inner_product:
+            order_by_clause = f"ORDER BY cosine_distance(embedding, {query_embedding}::Vector({self.dimensions}))"
 
         query = (
             "SELECT name, meta_data, content, content_id, embedding, usage FROM "
             f"{self.database_name}.{self.table_name} "
-            f"{where_query} {order_by_query} LIMIT {limit}"
+            f"{where_clause} {order_by_clause} LIMIT {limit}"
         )
         log_debug(f"Async Query: {query}")
 
@@ -549,8 +685,11 @@ class Databend(VectorDb):
         return search_results
 
     def drop(self) -> None:
+        """
+        Drop the table from the database.
+        """
         if self.table_exists():
-            log_debug(f"Deleting table: {self.table_name}")
+            log_debug(f"Drop table: {self.table_name}")
             self.client.exec(
                 f"DROP TABLE {self.database_name}.{self.table_name}",
             )
@@ -564,12 +703,25 @@ class Databend(VectorDb):
             )
 
     def exists(self) -> bool:
+        """
+        Check if the table exists in the database.
+
+        Returns:
+            bool: True if the table exists, False otherwise.
+        """
         return self.table_exists()
 
     async def async_exists(self) -> bool:
+        """Check if table exists asynchronously by running in a thread."""
         return await self.async_table_exists()
 
     def get_count(self) -> int:
+        """
+        Get the number of records in the table.
+
+        Returns:
+            int: The number of records in the table.
+        """
         result = self.client.query_row(
             f"SELECT count(*) FROM {self.database_name}.{self.table_name}",
         )
@@ -582,6 +734,12 @@ class Databend(VectorDb):
         log_debug("==== No need to optimize Databend. Skipping this step ====")
 
     def delete(self) -> bool:
+        """
+        Delete all records from the table.
+
+        Returns:
+            bool: True if deletion was successful, False otherwise.
+        """
         self.client.exec(
             f"DELETE FROM {self.database_name}.{self.table_name}",
         )
@@ -589,7 +747,6 @@ class Databend(VectorDb):
 
     def delete_by_id(self, id: str) -> bool:
         """
-
         Delete a document by its ID.
 
         Args:
@@ -691,21 +848,6 @@ class Databend(VectorDb):
             log_info(f"Error deleting documents with content_id {content_id}: {e}")
             return False
 
-    def content_hash_exists(self, content_hash: str) -> bool:
-        """
-        Validate if a row with this content_hash exists or not
-
-        Args:
-            content_hash (str): Content hash to check
-        """
-        result = self.client.query_row(
-            f"SELECT content_hash FROM {self.database_name}.{self.table_name} WHERE content_hash = '{content_hash}'",
-        )
-        if not result or len(result) == 0:
-            return False
-        else:
-            return True
-
     def _delete_by_content_hash(self, content_hash: str) -> bool:
         """
         Delete documents by content hash.
@@ -717,68 +859,3 @@ class Databend(VectorDb):
             return True
         except Exception:
             return False
-
-    def update_metadata(self, content_id: str, metadata: Dict[str, Any]) -> None:
-        """
-        Update the metadata for documents with the given content_id.
-
-        Args:
-            content_id (str): The content ID to update
-            metadata (Dict[str, Any]): The metadata to update
-        """
-
-        try:
-            # First, get existing documents with their current metadata and filters
-            result = self.client.query_all(
-                f"SELECT id, meta_data, filters FROM {self.database_name}.{self.table_name} WHERE content_id = '{content_id}'",
-            )
-
-            if result is None or len(result) == 0:
-                logger.debug(f"No documents found with content_id: {content_id}")
-                return
-
-            # Update each document
-            updated_count = 0
-            for row in result:
-                doc_id, current_meta_json, current_filters_json = row.values()
-
-                # Parse existing metadata
-                try:
-                    current_metadata = json.loads(current_meta_json) if current_meta_json else {}
-                except (json.JSONDecodeError, TypeError):
-                    current_metadata = {}
-
-                # Parse existing filters
-                try:
-                    current_filters = json.loads(current_filters_json) if current_filters_json else {}
-                except (json.JSONDecodeError, TypeError):
-                    current_filters = {}
-
-                # Merge existing metadata with new metadata
-                updated_metadata = current_metadata.copy()
-                updated_metadata.update(metadata)
-
-                # Merge existing filters with new metadata
-                updated_filters = current_filters.copy()
-                updated_filters.update(metadata)
-
-                # Update the document
-                update_params = parameters.copy()
-                metadata_json = json.dumps(updated_metadata)
-                filters_json = json.dumps(updated_filters)
-
-                self.client.command(
-                    f"ALTER TABLE {self.database_name}.{self.table_name} UPDATE meta_data = '{metadata_json}', filters = '{filters_json}' WHERE id = '{doc_id}'",
-                )
-                updated_count += 1
-
-            logger.debug(f"Updated metadata for {updated_count} documents with content_id: {content_id}")
-
-        except Exception as e:
-            logger.error(f"Error updating metadata for content_id '{content_id}': {e}")
-            raise
-
-
-
-
-
