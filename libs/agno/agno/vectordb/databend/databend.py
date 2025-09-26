@@ -58,6 +58,7 @@ class Databend(VectorDb):
                 f"databend://{self.username}:{self.password}@{self.host}:{self.port}/{self.database_name}?sslmode=disable"
             )
             client = databend_client.get_conn()
+            #client = databend_client.cursor()
 
         # Database attributes
         self.client = client
@@ -299,14 +300,14 @@ class Databend(VectorDb):
                 json.dumps(filters),
                 cleaned_content,
                 document.content_id,
-                document.embedding,
+                str(document.embedding),
                 json.dumps(document.usage),
                 created_at,
                 content_hash,
             ]
             rows.append(row)
 
-        self.client.exec(
+        self.client.executemany(
             f"INSERT INTO {self.database_name}.{self.table_name} VALUES",
             rows,
         )
@@ -315,6 +316,7 @@ class Databend(VectorDb):
     async def async_insert(
         self, content_hash: str, documents: List[Document], filters: Optional[Dict[str, Any]] = None
     ) -> None:
+        print("\n\n----insert22-------")
         """Insert documents asynchronously."""
         rows: List[List[Any]] = []
         async_client = await self._ensure_async_client()
@@ -334,17 +336,23 @@ class Databend(VectorDb):
                 json.dumps(filters),
                 cleaned_content,
                 document.content_id,
-                document.embedding,
+                str(document.embedding),
                 json.dumps(document.usage),
                 created_at,
                 content_hash,
             ]
             rows.append(row)
 
-        await async_client.exec(
+        #print("\n\n\n\n")
+        #print("rows=", rows)
+        #print("\n\n\n\n")
+
+        #result = await async_client.executemany(
+        result = await async_client.stream_load(
             f"INSERT INTO {self.database_name}.{self.table_name} VALUES",
             rows,
         )
+        print("result=", result)
         log_debug(f"Async inserted {len(documents)} documents")
 
     def upsert_available(self) -> bool:
@@ -383,14 +391,14 @@ class Databend(VectorDb):
                 json.dumps(filters),
                 cleaned_content,
                 document.content_id,
-                document.embedding,
+                str(document.embedding),
                 json.dumps(document.usage),
                 created_at,
                 content_hash,
             ]
             rows.append(row)
 
-        self.client.exec(
+        self.client.executemany(
             f"REPLACE INTO {self.database_name}.{self.table_name} ON(content_hash) VALUES",
             rows,
         )
@@ -426,14 +434,14 @@ class Databend(VectorDb):
                 json.dumps(filters),
                 cleaned_content,
                 document.content_id,
-                document.embedding,
+                str(document.embedding),
                 json.dumps(document.usage),
                 created_at,
                 content_hash,
             ]
             rows.append(row)
 
-        await async_client.exec(
+        await async_client.executemany(
             f"REPLACE INTO {self.database_name}.{self.table_name} ON(content_hash) VALUES",
             rows,
         )
